@@ -589,7 +589,8 @@ PlayerSettings:
   webWasm2023: 0
   webEnableSubmoduleStrippingCompatibility: 0
   webProgressiveAssetLoading: 0
-  scriptingDefineSymbols: {}
+  scriptingDefineSymbols:
+    Standalone: GLTFAST_KEEP_MESH_DATA
   additionalCompilerArguments: {}
   platformArchitecture: {}
   scriptingBackend:

@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using Clipper2Lib;
 using UnityEngine;
 
 public static class MeshSlicer
@@ -9,22 +10,30 @@ public static class MeshSlicer
         public Vector3 Origin, AxisU, AxisV;
     }
 
-    // shortcut: zakłada siatkę zamkniętą (watertight); otwarta siatka da urwane kontury.
+    // Clipper liczy na liczbach całkowitych: 6 miejsc po przecinku = 1 µm przy jednostkach w metrach.
+    const int ClipperPrecision = 6;
+
+    // Promień "domknięcia" przekroju (ułamek rozmiaru modelu): szczeliny węższe niż 2x tyle się zamykają.
+    const float CloseRadius = 0.005f;
+
     // up: kierunek "góry" obrazu przekroju (np. transform.up płaszczyzny); rzutowany na płaszczyznę.
-    public static Section Slice(Mesh mesh, Matrix4x4 localToWorld, Plane plane, Vector3 up)
+    public static Section Slice(Mesh mesh, Matrix4x4 localToWorld, Plane plane, Vector3 up) =>
+        Slice(mesh.vertices, mesh.triangles, mesh.bounds, localToWorld, plane, up);
+
+    // Wersja na gotowych tablicach: mesh.vertices/triangles kopiują cały mesh przy każdym wywołaniu, więc wołający może je trzymać.
+    public static Section Slice(Vector3[] verts, int[] tris, Bounds bounds, Matrix4x4 localToWorld, Plane plane, Vector3 up)
     {
         var n = plane.normal;
         var u = Vector3.Cross(up, n).normalized;
         var s = new Section
         {
             Contours = new List<Vector2[]>(),
-            Origin = plane.ClosestPointOnPlane(localToWorld.GetColumn(3)),
+            // Środek geometrii, nie pivot: importowane modele mają pivot często daleko od bryły, a skala wyświetlania rośnie wokół Origin.
+            Origin = plane.ClosestPointOnPlane(localToWorld.MultiplyPoint3x4(bounds.center)),
             AxisU = u,
             AxisV = Vector3.Cross(n, u),
         };
 
-        var verts = mesh.vertices;
-        var tris = mesh.triangles;
         var world = new Vector3[verts.Length];
         var dist = new float[verts.Length];
         for (int i = 0; i < verts.Length; i++)
@@ -33,34 +42,73 @@ public static class MeshSlicer
             dist[i] = plane.GetDistanceToPoint(world[i]);
         }
 
-        var links = new Dictionary<Vector3, List<Vector3>>();
+        // Spawanie punktów cięcia na siatce 1e-5 rozmiaru modelu (0.01 mm przy 1 m): skleja szwy, gdzie wierzchołki
+        // w Blenderze nie zostały złączone (Merge by Distance), a i tak jest dużo drobniej niż siatka symulacji.
+        float size = localToWorld.MultiplyVector(bounds.size).magnitude;
+        float weld = Mathf.Max(size * 1e-5f, 1e-9f);
+        Vector3Int Key(Vector3 p) => Vector3Int.RoundToInt(p / weld);
+        Vector2 ToPlane(Vector3 p) => new(Vector3.Dot(p - s.Origin, s.AxisU), Vector3.Dot(p - s.Origin, s.AxisV));
+
+        // Odcinki skierowane zgodnie z orientacją trójkąta, żeby sąsiednie odcinki łączyły się w łańcuchy (koniec -> początek).
+        var next = new Dictionary<Vector3Int, Vector3Int>();
+        var pos = new Dictionary<Vector3Int, Vector2>();
+        var cut = new Vector3[2];
         for (int i = 0; i < tris.Length; i += 3)
         {
-            Vector3? first = null;
-            for (int k = 0; k < 3; k++)
+            int c = 0;
+            for (int k = 0; k < 3 && c < 2; k++)
             {
                 int a = tris[i + k], b = tris[i + (k + 1) % 3];
-                if (dist[a] >= 0 == dist[b] >= 0) continue;
-                var p = Cut(world[a], dist[a], world[b], dist[b]);
-                if (first == null) first = p;
-                else if (!first.Value.Equals(p)) { Link(links, first.Value, p); Link(links, p, first.Value); }
+                if (dist[a] >= 0 != dist[b] >= 0) cut[c++] = Cut(world[a], dist[a], world[b], dist[b]);
             }
+            if (c < 2) continue;
+            Vector3 w0 = world[tris[i]], faceN = Vector3.Cross(world[tris[i + 1]] - w0, world[tris[i + 2]] - w0);
+            if (Vector3.Dot(Vector3.Cross(faceN, n), cut[1] - cut[0]) < 0) (cut[0], cut[1]) = (cut[1], cut[0]);
+            Vector3Int k0 = Key(cut[0]), k1 = Key(cut[1]);
+            if (k0 == k1) continue;
+            next[k0] = k1; // przy rozgałęzieniu wygrywa ostatni odcinek; reszta to osobny łańcuch, sklejany niżej pogrubieniem
+            pos[k0] = ToPlane(cut[0]);
+            pos[k1] = ToPlane(cut[1]);
         }
 
-        var visited = new HashSet<Vector3>();
-        foreach (var start in links.Keys)
+        // Najpierw początki otwartych łańcuchów, żeby nie zaczynać w ich środku; potem zamknięte pętle.
+        var heads = new HashSet<Vector3Int>(next.Keys);
+        heads.ExceptWith(next.Values);
+        var starts = new List<Vector3Int>(heads);
+        starts.AddRange(next.Keys);
+
+        // Łańcuchy jako otwarte linie (nigdy nie domykane prostą - to dawało "skoki" przez cały model).
+        var lines = new PathsD();
+        var visited = new HashSet<Vector3Int>();
+        foreach (var start in starts)
         {
             if (visited.Contains(start)) continue;
-            var loop = new List<Vector2>();
-            for (Vector3? cur = start; cur != null && visited.Add(cur.Value);)
+            var line = new PathD();
+            var cur = start;
+            bool more = true;
+            while (more && visited.Add(cur))
             {
-                var d = cur.Value - s.Origin;
-                loop.Add(new Vector2(Vector3.Dot(d, s.AxisU), Vector3.Dot(d, s.AxisV)));
-                var next = (Vector3?)null;
-                foreach (var p in links[cur.Value]) if (!visited.Contains(p)) { next = p; break; }
-                cur = next;
+                line.Add(new PointD(pos[cur].x, pos[cur].y));
+                more = next.TryGetValue(cur, out cur);
             }
-            if (loop.Count >= 3) s.Contours.Add(loop.ToArray());
+            if (more) line.Add(new PointD(pos[cur].x, pos[cur].y)); // dojście do odwiedzonego punktu: domknięcie pętli albo styk z innym łańcuchem
+            if (line.Count >= 2) lines.Add(line);
+        }
+
+        // Domknięcie morfologiczne: pogrub linie o r (sklejają się kawałki i szczeliny < 2r), zsumuj, zostaw tylko kontury
+        // zewnętrzne (dziura w przekroju 2D jest zamknięta, przepływ jej nie widzi; przy pustych modelach to artefakt)
+        // i zwęź o r z powrotem do oryginalnego obrysu. Pojedyncze luźne linie (np. podłoga sceny) znikają.
+        double r = size * CloseRadius;
+        var thick = Clipper.InflatePaths(lines, r, JoinType.Round, EndType.Round, 2, ClipperPrecision);
+        // Dziury usuwane dopiero po sumie: pierścień z kilku osobnych łańcuchów ma dziurę dopiero po zsumowaniu.
+        var filled = Clipper.Union(thick, null, FillRule.NonZero, ClipperPrecision);
+        filled.RemoveAll(path => Clipper.Area(path) <= 0);
+        filled = Clipper.Union(filled, null, FillRule.NonZero, ClipperPrecision); // wchłania wyspy, które leżały w usuniętych dziurach
+        foreach (var path in Clipper.InflatePaths(filled, -r, JoinType.Round, EndType.Polygon, 2, ClipperPrecision))
+        {
+            var arr = new Vector2[path.Count];
+            for (int i = 0; i < arr.Length; i++) arr[i] = new Vector2((float)path[i].x, (float)path[i].y);
+            s.Contours.Add(arr);
         }
         return s;
     }
@@ -110,12 +158,6 @@ public static class MeshSlicer
         return a + (b - a) * (da / (da - db));
     }
 
-    static void Link(Dictionary<Vector3, List<Vector3>> links, Vector3 from, Vector3 to)
-    {
-        if (!links.TryGetValue(from, out var list)) links[from] = list = new List<Vector3>();
-        list.Add(to);
-    }
-
 #if UNITY_EDITOR
     [UnityEditor.MenuItem("Tools/MeshSlicer Self-Check")]
     static void SelfCheck()
@@ -126,6 +168,57 @@ public static class MeshSlicer
         int solid = 0;
         foreach (var cell in Rasterize(s.Contours, new Rect(-1, -1, 2, 2), 20, 20)) if (cell) solid++;
         Debug.Assert(solid == 100, $"solid cells: {solid}");
+
+        // Dwa nachodzące sześciany (jak osobne obiekty z Blendera) -> suma, nie dziura w części wspólnej.
+        var two = new Mesh();
+        two.CombineMeshes(new[]
+        {
+            new CombineInstance { mesh = cube, transform = Matrix4x4.identity },
+            new CombineInstance { mesh = cube, transform = Matrix4x4.Translate(new Vector3(0.5f, 0f, 0f)) },
+        });
+        s = Slice(two, Matrix4x4.identity, new Plane(Vector3.forward, Vector3.zero), Vector3.up);
+        solid = 0;
+        foreach (var cell in Rasterize(s.Contours, new Rect(-1, -1, 2, 2), 20, 20)) if (cell) solid++;
+        Debug.Assert(s.Contours.Count == 1 && solid == 150, $"union: contours {s.Contours.Count}, solid cells {solid}");
+        Object.DestroyImmediate(two);
+
+        // Model pusty w środku: sześcian 2x z odwróconym sześcianem 1x w środku (ściany z grubością) -> pełny przekrój.
+        var flipped = Object.Instantiate(cube);
+        var t = flipped.triangles;
+        for (int i = 0; i < t.Length; i += 3) (t[i], t[i + 1]) = (t[i + 1], t[i]);
+        flipped.triangles = t;
+        var hollow = new Mesh();
+        hollow.CombineMeshes(new[]
+        {
+            new CombineInstance { mesh = cube, transform = Matrix4x4.Scale(Vector3.one * 1.6f) },
+            new CombineInstance { mesh = flipped, transform = Matrix4x4.Scale(Vector3.one * 0.8f) },
+        });
+        s = Slice(hollow, Matrix4x4.identity, new Plane(Vector3.forward, Vector3.zero), Vector3.up);
+        solid = 0;
+        foreach (var cell in Rasterize(s.Contours, new Rect(-1, -1, 2, 2), 20, 20)) if (cell) solid++;
+        Debug.Assert(s.Contours.Count == 1 && solid == 256, $"hollow: contours {s.Contours.Count}, solid cells {solid}");
+        Object.DestroyImmediate(hollow);
+        Object.DestroyImmediate(flipped);
+
+        // Otwarty model: 4 osobne ściany boczne, w narożnikach szczelina 0.007 (< 2r) -> pełny kwadrat, nie pusty pierścień.
+        var wv = new List<Vector3>();
+        var wt = new List<int>();
+        for (int w = 0; w < 4; w++)
+        {
+            var q = Quaternion.Euler(0f, 0f, 90f * w);
+            int b = wv.Count;
+            foreach (var (y, z) in new[] { (-0.495f, -0.5f), (0.495f, -0.5f), (0.495f, 0.5f), (-0.495f, 0.5f) })
+                wv.Add(q * new Vector3(0.5f, y, z));
+            wt.AddRange(new[] { b, b + 1, b + 2, b, b + 2, b + 3 });
+        }
+        var open = new Mesh();
+        open.SetVertices(wv);
+        open.SetTriangles(wt, 0);
+        s = Slice(open, Matrix4x4.identity, new Plane(Vector3.forward, Vector3.zero), Vector3.up);
+        solid = 0;
+        foreach (var cell in Rasterize(s.Contours, new Rect(-1, -1, 2, 2), 20, 20)) if (cell) solid++;
+        Debug.Assert(s.Contours.Count == 1 && solid == 100, $"open walls: contours {s.Contours.Count}, solid cells {solid}");
+        Object.DestroyImmediate(open);
         Debug.Log("MeshSlicer self-check done");
     }
 #endif
