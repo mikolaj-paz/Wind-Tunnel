@@ -1103,15 +1103,15 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: a86d4edd057e6ee4e83ef6a9286d3cd8, type: 3}
   m_Name: 
   m_EditorClassIdentifier: '::'
-  slicer: {fileID: 1381238161}
-  texture: {fileID: 8400000, guid: e0a34ce80c8a42c49bb8846934d5632e, type: 2}
+  slicerController: {fileID: 1381238161}
+  previewCameraOutputTexture: {fileID: 8400000, guid: e0a34ce80c8a42c49bb8846934d5632e, type: 2}
   models:
   - {fileID: 10202, guid: 0000000000000000e000000000000000, type: 0}
   - {fileID: 10207, guid: 0000000000000000e000000000000000, type: 0}
   - {fileID: 10206, guid: 0000000000000000e000000000000000, type: 0}
   - {fileID: 10208, guid: 0000000000000000e000000000000000, type: 0}
-  fill: 0.7
-  widthFraction: 0.25
+  objectSizeToPlaneRatio: 0.8
+  windowToScreenWidthRatio: 0.25
 --- !u!114 &1711053971
 MonoBehaviour:
   m_ObjectHideFlags: 0
