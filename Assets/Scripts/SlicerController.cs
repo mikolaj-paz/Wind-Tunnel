@@ -1,5 +1,6 @@
 using UnityEngine;
 
+// Odświeża przekrój, gdy płaszczyzna albo obiekt się ruszy, i trzyma jeden obiekt sceny z jego podglądem.
 public class SlicerController : MonoBehaviour
 {
     [SerializeField] private MeshFilter _objectToSlice;
@@ -8,50 +9,69 @@ public class SlicerController : MonoBehaviour
 
     public MeshFilter ObjectToSlice { get => _objectToSlice; set => _objectToSlice = value; }
     public Transform PlaneTransform => _planeTransform;
-    // Skala wyświetlanego przekroju względem oryginalnych wymiarów modelu (1 = jednostki z pliku, np. metry z Blendera).
     public float DisplayScale { get; set; } = 1f;
 
-    private Plane _slicePlane;
     private GameObject _sliceObject;
-    // Kopie danych mesha, czytane raz na mesh (zakłada, że mesh nie jest edytowany w miejscu po podpięciu).
     private Mesh _cachedMesh;
     private Vector3[] _verts;
     private int[] _tris;
 
-    void CreateSlice()
-    {
-        if (_sliceObject != null)
-        {
-            Destroy(_sliceObject.GetComponent<MeshFilter>().sharedMesh);
-            Destroy(_sliceObject);
-            _sliceObject = null;
-        }
-
-        var src = _objectToSlice.transform;
-        var mesh = _objectToSlice.sharedMesh;
-        if (mesh != _cachedMesh)
-        {
-            _cachedMesh = mesh;
-            _verts = mesh.vertices;
-            _tris = mesh.triangles;
-        }
-        var section = MeshSlicer.Slice(_verts, _tris, mesh.bounds, src.localToWorldMatrix, _slicePlane, _planeTransform.up);
-
-        var sliceObject = MeshSlicer.CreateObject(section, _sliceMaterial);
-        _sliceObject = sliceObject;
-    }
-
     void Update()
     {
+        if (ConsumeTransformChanges()) RebuildSlice();
+        if (_sliceObject != null) _sliceObject.transform.localScale = Vector3.one * SliceObjectScale();
+    }
+
+    // true, jeśli od ostatniego wywołania ruszyła się płaszczyzna albo obiekt.
+    bool ConsumeTransformChanges()
+    {
         var obj = _objectToSlice.transform;
-        if (_planeTransform.hasChanged || obj.hasChanged)
-        {
-            _planeTransform.hasChanged = false;
-            obj.hasChanged = false;
-            _slicePlane = new Plane(_planeTransform.forward, _planeTransform.position);
-            CreateSlice();
-        }
-        // Przekrój liczony jest w świecie, gdzie model jest dopasowany do płaszczyzny; dzielenie przez skalę obiektu cofa to dopasowanie.
-        if (_sliceObject != null) _sliceObject.transform.localScale = Vector3.one * (DisplayScale / obj.lossyScale.x);
+        bool changed = _planeTransform.hasChanged || obj.hasChanged;
+        _planeTransform.hasChanged = obj.hasChanged = false;
+        return changed;
+    }
+
+    float SliceObjectScale() => DisplayScale / _objectToSlice.transform.lossyScale.x;
+
+    void RebuildSlice()
+    {
+        DestroySliceObject();
+        _sliceObject = CreateSliceObject(SliceCurrentMesh(), _sliceMaterial);
+    }
+
+    Section SliceCurrentMesh()
+    {
+        var mesh = _objectToSlice.sharedMesh;
+        CacheMeshData(mesh);
+        var plane = new Plane(_planeTransform.forward, _planeTransform.position);
+        return MeshSlicer.Slice(_verts, _tris, mesh.bounds, _objectToSlice.transform.localToWorldMatrix, plane, _planeTransform.up);
+    }
+
+    void CacheMeshData(Mesh mesh)
+    {
+        if (mesh == _cachedMesh) return;
+        _cachedMesh = mesh;
+        _verts = mesh.vertices;
+        _tris = mesh.triangles;
+    }
+
+    void DestroySliceObject()
+    {
+        if (_sliceObject == null) return;
+        Destroy(_sliceObject.GetComponent<MeshFilter>().sharedMesh);
+        Destroy(_sliceObject);
+        _sliceObject = null;
+    }
+
+    // Obiekt do wyświetlenia w pełnej rozdzielczości (kontury w płaszczyźnie XY sceny 2D).
+    static GameObject CreateSliceObject(Section section, Material material)
+    {
+        var go = new GameObject("Section");
+        var col = go.AddComponent<PolygonCollider2D>();
+        col.pathCount = section.Contours.Count;
+        for (int i = 0; i < section.Contours.Count; i++) col.SetPath(i, section.Contours[i]);
+        go.AddComponent<MeshFilter>().sharedMesh = col.CreateMesh(false, false);
+        go.AddComponent<MeshRenderer>().sharedMaterial = material;
+        return go;
     }
 }

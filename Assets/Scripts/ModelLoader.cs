@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using System.IO;
 using System.Threading.Tasks;
 using GLTFast;
@@ -16,37 +17,60 @@ public static class ModelLoader
         root.SetActive(false); // żeby tymczasowa kopia nie mignęła w scenie
         try
         {
-            // URI musi być bezwzględne: .gltf szuka obok siebie plików .bin i tekstur.
-            if (!await gltf.LoadFile(path, new System.Uri(path)) || !await gltf.InstantiateMainSceneAsync(root.transform))
-                throw new IOException("Nie udało się wczytać: " + path);
-
-            var toRoot = root.transform.worldToLocalMatrix;
-            var parts = new System.Collections.Generic.List<CombineInstance>();
-            long verts = 0;
-            var sources = new System.Collections.Generic.List<(Mesh mesh, Transform t)>();
-            foreach (var mf in root.GetComponentsInChildren<MeshFilter>(true)) sources.Add((mf.sharedMesh, mf.transform));
-            // Obiekty z armaturą lub shape keys glTFast tworzy jako SkinnedMeshRenderer, bez MeshFilter.
-            // shortcut: bierze mesh w pozie spoczynkowej (bind pose), bez kości i shape keys; gdyby była potrzebna poza z pliku, użyć BakeMesh.
-            foreach (var smr in root.GetComponentsInChildren<SkinnedMeshRenderer>(true)) sources.Add((smr.sharedMesh, smr.transform));
-            foreach (var (m, t) in sources)
-            {
-                if (m == null) continue;
-                verts += m.vertexCount;
-                for (int s = 0; s < m.subMeshCount; s++)
-                    parts.Add(new CombineInstance { mesh = m, subMeshIndex = s, transform = toRoot * t.localToWorldMatrix });
-            }
+            await LoadIntoScene(gltf, path, root.transform);
+            var parts = CollectParts(root.transform);
             if (parts.Count == 0) throw new IOException("Plik nie zawiera meshy: " + path);
-
-            var mesh = new Mesh { name = Path.GetFileNameWithoutExtension(path) };
-            if (verts > ushort.MaxValue) mesh.indexFormat = IndexFormat.UInt32; // duże modele
-            mesh.CombineMeshes(parts.ToArray(), true, true);
-            mesh.RecalculateBounds();
-            return mesh;
+            return Combine(parts, Path.GetFileNameWithoutExtension(path));
         }
         finally
         {
             Object.Destroy(root);
-            gltf.Dispose(); // zwalnia meshe/tekstury glTFast; nasz scalony mesh jest osobną kopią
+            gltf.Dispose();
         }
+    }
+
+    static async Task LoadIntoScene(GltfImport gltf, string path, Transform root)
+    {
+        if (!await gltf.LoadFile(path, new System.Uri(path)) || !await gltf.InstantiateMainSceneAsync(root))
+            throw new IOException("Nie udało się wczytać: " + path);
+    }
+
+    static List<CombineInstance> CollectParts(Transform root)
+    {
+        var toRoot = root.worldToLocalMatrix;
+        var parts = new List<CombineInstance>();
+        foreach (var (mesh, t) in MeshSources(root))
+            for (int s = 0; s < mesh.subMeshCount; s++)
+                parts.Add(new CombineInstance { mesh = mesh, subMeshIndex = s, transform = toRoot * t.localToWorldMatrix });
+        return parts;
+    }
+
+    static List<(Mesh mesh, Transform t)> MeshSources(Transform root)
+    {
+        var sources = new List<(Mesh, Transform)>();
+        foreach (var mf in root.GetComponentsInChildren<MeshFilter>(true))
+            if (mf.sharedMesh != null) sources.Add((mf.sharedMesh, mf.transform));
+        // Obiekty z armaturą lub shape keys glTFast tworzy jako SkinnedMeshRenderer, bez MeshFilter.
+        // shortcut: bierze mesh w pozie spoczynkowej (bind pose), bez kości i shape keys; gdyby była potrzebna poza z pliku, użyć BakeMesh.
+        foreach (var smr in root.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            if (smr.sharedMesh != null) sources.Add((smr.sharedMesh, smr.transform));
+        return sources;
+    }
+
+    static Mesh Combine(List<CombineInstance> parts, string name)
+    {
+        var mesh = new Mesh { name = name };
+        if (VertexCount(parts) > ushort.MaxValue) mesh.indexFormat = IndexFormat.UInt32; // duże modele
+        mesh.CombineMeshes(parts.ToArray(), true, true);
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    // Liczone per submesh, więc może zawyżyć - wtedy co najwyżej UInt32 włączy się wcześniej, co jest bezpieczne.
+    static long VertexCount(List<CombineInstance> parts)
+    {
+        long count = 0;
+        foreach (var p in parts) count += p.mesh.vertexCount;
+        return count;
     }
 }
