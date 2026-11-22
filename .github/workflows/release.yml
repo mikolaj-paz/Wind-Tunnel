@@ -25,9 +25,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        targetPlatform:
-          - StandaloneWindows64
-          - StandaloneLinux64
+        include:
+          - targetPlatform: StandaloneWindows64
+            image: windows-mono
+          - targetPlatform: StandaloneLinux64
+            image: linux-il2cpp
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -62,6 +64,8 @@ jobs:
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         with:
           targetPlatform: ${{ matrix.targetPlatform }}
+          # unity-builder@v4 defaults to "-3" images, which don't exist for this Unity version; bump with ProjectVersion.txt.
+          customImage: unityci/editor:ubuntu-6000.6.10f1-${{ matrix.image }}-4
           buildName: WindTunnel
           versioning: Custom
           version: ${{ github.ref_name }}
